@@ -1,3 +1,3 @@
 # gym-object-manipulation
 
---pip install -e .--
+```pip install -e .```
