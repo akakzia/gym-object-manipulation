@@ -22,7 +22,7 @@ register(id='FetchManipulate3CloseObjects-v0',
 register(id='FetchManipulate3Objects-v0',
          entry_point='gym_object_manipulation.envs:FetchManipulateEnv',
          kwargs=kwargs,
-         max_episode_steps=50,)
+         max_episode_steps=100,)
 
 register(id='FetchManipulate3AboveObjects-v0',
          entry_point='gym_object_manipulation.envs:FetchManipulateAboveEnv',

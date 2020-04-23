@@ -27,6 +27,16 @@ def signed_distance(x, y):
     return np.linalg.norm(x[:2] - y[:2]) * np.sign(x[1] - y[1])
 
 
+def is_grasped(body, obj):
+    """
+    A temporary function that determines whether obj is grasped by the gripper or not
+    Testing a supplementary unary predicate to learn how to grasp before arranging
+    """
+    if np.linalg.norm(body[:2] - obj[:2]) <= 0.005 and body[2] - obj[2] <= 0.03 and body[3] + body[4] <= 0.06:
+        return 1
+    return 0
+
+
 def above(x, y):
     """
     A function that returns whether the object x is above y
@@ -35,7 +45,7 @@ def above(x, y):
     """eps = 0.001
     above = 0.05 - eps < (x[2] - y[2]) < 0.05 + eps
     return above and 0 <= np.linalg.norm(x[:2] - y[:2]) < 0.025 * np.sqrt(2) - eps"""
-    return np.linalg.norm(x[:2] - y[:2]) < 0.07 and 0.06 > x[2] - y[2] > 0.01
+    return np.linalg.norm(x[:2] - y[:2]) < 0.04 and 0.06 > x[2] - y[2] > 0.01
     #return np.linalg.norm(x[:2] - y[:2]) < 0.07 and 0.06 > np.abs(x[2] - y[2]) > 0.01
 
 
@@ -191,7 +201,7 @@ class FetchManipulateEnv(robot_env.RobotEnv):
         utils.ctrl_set_action(self.sim, action)
         utils.mocap_set_action(self.sim, action)
     
-    def _get_configuration(self, positions):
+    def _get_configuration(self, body, positions):
         close_config = np.array([])
         above_config = np.array([])
         below_config = np.array([])
@@ -212,6 +222,7 @@ class FetchManipulateEnv(robot_env.RobotEnv):
 
             close_config = np.array([(distance <= self.predicate_threshold).astype(np.float32)
                                      for distance in object_rel_distances])
+            #close_config = np.array([is_grasped(body, position) for position in positions])
         if "above" in self.predicates:
             if self.num_blocks == 3:
                 object_permutations = [(positions[0], positions[1]), (positions[1], positions[0]), (positions[0], positions[2]),
@@ -307,7 +318,7 @@ class FetchManipulateEnv(robot_env.RobotEnv):
 
         self.goal_size = len(object_rel_distances)
         
-        achieved_goal = self._get_configuration(objects_positions)
+        achieved_goal = self._get_configuration(obs, objects_positions)
         """if self.num_predicates == 2:
             achieved_goal = self._get_configuration(objects_positions)
         else:    
@@ -342,6 +353,31 @@ class FetchManipulateEnv(robot_env.RobotEnv):
             #self.sim.model.site_pos[site_id] = self.goal[i*3:(i+1)*3] - sites_offset[i]
 
         self.sim.forward()
+
+    def _grasp(self, obs, target_idx):
+        success = False
+        itr = 0
+        observation = obs['observation']
+        # Make sure to get high enough not to hit objects
+        for _ in range(10):
+            next_obs, r, d, info = self.step([0, 0, 1, 1])
+            observation = next_obs['observation']
+        # Reach object and grasp it
+        while not success and itr < 20:
+            action = np.concatenate((7 * (-observation[:3] + observation[10 + 15 * target_idx:13 + 15 * target_idx]), np.ones(1)))
+            if np.linalg.norm(-observation[:3] + observation[10 + 15 * target_idx:13 + 15 * target_idx]) < 0.005:
+                for _ in range(15):
+                    action = [0., 0., 0.4, -1]
+                    next_obs, r, d, info = self.step(action)
+                    observation = next_obs['observation']
+                    itr += 1
+                success = True
+            else:
+                next_obs, r, d, info = self.step(action)
+                observation = next_obs['observation']
+                itr += 1
+        obs['observation'] = observation
+        return obs
 
     def reset(self):
         # Attempt to reset the simulator. Since we randomize initial conditions, it
@@ -413,6 +449,7 @@ class FetchManipulateEnv(robot_env.RobotEnv):
         self.sim.forward()
 
         obs = self._get_obs()
+
         return obs
 
     def _get_valid(self, l1, l2):
@@ -552,7 +589,7 @@ class FetchManipulateEnv(robot_env.RobotEnv):
         self.initial_gripper_xpos = self.sim.data.get_site_xpos('robot0:grip').copy()
         self.height_offset = self.sim.data.get_site_xpos('object0')[2]
     
-    def reset_goal(self, goal):
+    '''def reset_goal(self, goal, bucket=0, guide_proba=0, eval=True):
         
         # self.target_goal = self._sample_goal()
         self.target_goal = goal
@@ -565,59 +602,319 @@ class FetchManipulateEnv(robot_env.RobotEnv):
         # temp = [[-1, -1], [1, 0], [-1, 1]]
 
         # Guide learning by generating a stack in initialization
-        if "above" in self.predicates or "right_close" in self.predicates:
-            self.guide = True
+        # stage = np.random.choice(np.arange(5), p=p)
 
-        if self.guide:
-            stack_level_proba = np.random.uniform()
-            if stack_level_proba > 0.7:
-                stack = list(np.random.choice([i for i in range(self.num_blocks)], 3, replace=False))
-                z_stack = [0.525, 0.475, 0.425]
-            else:
-                stack = list(np.random.choice([i for i in range(self.num_blocks)], 2, replace=False))
-                z_stack = [0.475, 0.425]
-            k = np.random.uniform()
-            if k < 0.7:
-                for i, obj_name in enumerate(self.object_names):
-                    object_qpos = self.sim.data.get_joint_qpos('{}:joint'.format(obj_name))
-                    assert object_qpos.shape == (7,)
+        self.guide = np.random.uniform() < guide_proba
+
+        proba_stack_3 = 0  # P(stack 3 | stack)
+        proba_stack = 0
+        
+        if not eval:
+            if bucket == 3 and self.guide:
+                proba_stack = 1
+                proba_stack_3 = 1
+            if bucket == 1 and self.guide:
+                proba_stack = 0
+            if bucket in [0, 2, 4]:
+                proba_stack_3 = 0.7  # P(stack 3 | stack)
+                proba_stack = 0.3
+
+        idx_grasp = np.random.choice([i for i in range(self.num_blocks)])
+
+        if np.random.uniform() < proba_stack_3:
+            stack = list(np.random.choice([i for i in range(self.num_blocks)], 3, replace=False))
+            z_stack = [0.525, 0.475, 0.425]
+        else:
+            stack = list(np.random.choice([i for i in range(self.num_blocks)], 2, replace=False))
+            z_stack = [0.475, 0.425]
+        
+        if np.random.uniform() < 1 - proba_stack:
+            for i, obj_name in enumerate(self.object_names):
+                object_qpos = self.sim.data.get_joint_qpos('{}:joint'.format(obj_name))
+                assert object_qpos.shape == (7,)
+                object_qpos[2] = 0.425
+                object_xpos = self.initial_gripper_xpos[:2] + self.np_random.uniform(-self.obj_range,
+                                                                                     self.obj_range,
+                                                                                     size=2)
+                object_qpos[:2] = object_xpos
+
+                self.sim.data.set_joint_qpos('{}:joint'.format(obj_name), object_qpos)
+
+        else:
+            temp_rand = self.np_random.uniform(-self.obj_range, self.obj_range, size=2)
+            for i, obj_name in enumerate(self.object_names):
+                object_qpos = self.sim.data.get_joint_qpos('{}:joint'.format(obj_name))
+                assert object_qpos.shape == (7,)
+                if i in stack:
+                    object_qpos[2] = z_stack[stack.index(i)]
+                    object_xpos = self.initial_gripper_xpos[:2] + temp_rand
+                    object_qpos[:2] = object_xpos
+
+                else:
                     object_qpos[2] = 0.425
                     object_xpos = self.initial_gripper_xpos[:2] + self.np_random.uniform(-self.obj_range,
                                                                                          self.obj_range,
                                                                                          size=2)
                     object_qpos[:2] = object_xpos
 
-                    self.sim.data.set_joint_qpos('{}:joint'.format(obj_name), object_qpos)
-            else:
-                temp_rand = self.np_random.uniform(-self.obj_range, self.obj_range, size=2)
-                for i, obj_name in enumerate(self.object_names):
-                    object_qpos = self.sim.data.get_joint_qpos('{}:joint'.format(obj_name))
-                    assert object_qpos.shape == (7,)
-                    if i in stack:
-                        object_qpos[2] = z_stack[stack.index(i)]
-                        object_xpos = self.initial_gripper_xpos[:2] + temp_rand
-                        object_qpos[:2] = object_xpos
+                self.sim.data.set_joint_qpos('{}:joint'.format(obj_name), object_qpos)
+            if len(stack) == self.num_blocks:
+                idx_grasp = stack[0]
+        self.sim.forward()
 
-                    else:
-                        object_qpos[2] = 0.425
-                        object_xpos = self.initial_gripper_xpos[:2] + self.np_random.uniform(-self.obj_range,
-                                                                                             self.obj_range,
-                                                                                             size=2)
-                        object_qpos[:2] = object_xpos
+        obs = self._get_obs()
+        if bucket in [0, 2, 3] and self.guide and not eval:
+            obs = self._grasp(obs, idx_grasp)
+        
+        return obs'''
 
-                    self.sim.data.set_joint_qpos('{}:joint'.format(obj_name), object_qpos)
+    def reset_goal(self, goal, biased_init=False, eval=True):
+        self.target_goal = goal
 
-        else:
+        self.sim.set_state(self.initial_state)
+
+        # If biased_init==False or during evaluation time, generate blocks on the table with no stacks
+        if not biased_init or eval:
             for i, obj_name in enumerate(self.object_names):
                 object_qpos = self.sim.data.get_joint_qpos('{}:joint'.format(obj_name))
                 assert object_qpos.shape == (7,)
                 object_qpos[2] = 0.425
-                object_xpos = self.initial_gripper_xpos[:2] + self.np_random.uniform(-self.obj_range, self.obj_range,
+                object_xpos = self.initial_gripper_xpos[:2] + self.np_random.uniform(-self.obj_range,
+                                                                                     self.obj_range,
                                                                                      size=2)
                 object_qpos[:2] = object_xpos
 
                 self.sim.data.set_joint_qpos('{}:joint'.format(obj_name), object_qpos)
-        self.sim.forward()
 
+            self.sim.forward()
+            obs = self._get_obs()
+
+            return obs
+
+        stack_level_proba = np.random.uniform()
+        if stack_level_proba > 0.7:
+            stack = list(np.random.choice([i for i in range(self.num_blocks)], 3, replace=False))
+            z_stack = [0.525, 0.475, 0.425]
+        else:
+            stack = list(np.random.choice([i for i in range(self.num_blocks)], 2, replace=False))
+            z_stack = [0.475, 0.425]
+        k = np.random.uniform()
+
+        idx_grasp = np.random.choice([i for i in range(self.num_blocks)])
+        if k < 0.7:
+            for i, obj_name in enumerate(self.object_names):
+                object_qpos = self.sim.data.get_joint_qpos('{}:joint'.format(obj_name))
+                assert object_qpos.shape == (7,)
+                object_qpos[2] = 0.425
+                object_xpos = self.initial_gripper_xpos[:2] + self.np_random.uniform(-self.obj_range,
+                                                                                     self.obj_range,
+                                                                                     size=2)
+                object_qpos[:2] = object_xpos
+
+                self.sim.data.set_joint_qpos('{}:joint'.format(obj_name), object_qpos)
+        else:
+            temp_rand = self.np_random.uniform(-self.obj_range, self.obj_range, size=2)
+            for i, obj_name in enumerate(self.object_names):
+                object_qpos = self.sim.data.get_joint_qpos('{}:joint'.format(obj_name))
+                assert object_qpos.shape == (7,)
+                if i in stack:
+                    object_qpos[2] = z_stack[stack.index(i)]
+                    object_xpos = self.initial_gripper_xpos[:2] + temp_rand
+                    object_qpos[:2] = object_xpos
+
+                else:
+                    object_qpos[2] = 0.425
+                    object_xpos = self.initial_gripper_xpos[:2] + self.np_random.uniform(-self.obj_range,
+                                                                                         self.obj_range,
+                                                                                         size=2)
+                    object_qpos[:2] = object_xpos
+
+                    idx_grasp = i
+
+                self.sim.data.set_joint_qpos('{}:joint'.format(obj_name), object_qpos)
+            if len(stack) == self.num_blocks:
+                idx_grasp = stack[0]
+
+        self.sim.forward()
         obs = self._get_obs()
+        
+        if np.random.uniform() < 0.6:
+            obs = self._grasp(obs, idx_grasp)
         return obs
+
+    def reset_init(self, init_config, target_goal):
+        self.target_goal = target_goal
+
+        self.sim.set_state(self.initial_state)
+        possible_stacks = np.array([[0, 1], [1, 0], [0, 2], [2, 0], [1, 2], [2, 1]])
+        actual_stacks = possible_stacks[np.where(np.array(init_config[-6:]) == 1.)]
+        blocks_set = [False for i in range(self.num_blocks)]
+        positions = [None for i in range(self.num_blocks)]
+        if actual_stacks.shape[0] > 0:
+            # There is at least one stack
+            if actual_stacks.shape[0] == 1.:
+                # There exactly one stack
+                stack = actual_stacks[0]
+                z_stack = [0.475, 0.425]
+                offset_on_table = self.np_random.uniform(-self.obj_range, self.obj_range, size=2)
+                for i in stack:
+                    object_qpos = self.sim.data.get_joint_qpos('{}:joint'.format(self.object_names[i]))
+                    object_qpos[2] = z_stack[np.where(stack == i)[0][0]]
+                    object_xpos = self.initial_gripper_xpos[:2] + offset_on_table
+                    object_qpos[:2] = object_xpos
+                    blocks_set[i] = True
+                    positions[i] = object_qpos[:3]
+                    self.sim.data.set_joint_qpos('{}:joint'.format(self.object_names[i]), object_qpos)
+            if actual_stacks.shape[0] > 1.:
+                # There are two stacks
+                if actual_stacks[0][0] == actual_stacks[1][0]:
+                    # One block above two blocks (pyramid)
+                    bot_block_1 = actual_stacks[0][1]
+                    bot_block_2 = actual_stacks[1][1]
+                    top_block = actual_stacks[0][0]
+                    pos_on_table_1 = self.initial_gripper_xpos[:2] + self.np_random.uniform(-self.obj_range, self.obj_range,
+                                                                                            size=2)
+                    pos_on_table_2 = pos_on_table_1 + [0, 0.05]
+                    pos_on_table_3 = pos_on_table_1 + [0, 0.025]
+                    z = [0.425, 0.425, 0.475]
+                    xy = [pos_on_table_1, pos_on_table_2, pos_on_table_3]
+                    for i, block in enumerate([bot_block_1, bot_block_2, top_block]):
+                        object_qpos = self.sim.data.get_joint_qpos('{}:joint'.format(self.object_names[block]))
+                        object_qpos[2] = z[i]
+                        object_xpos = xy[i]
+                        object_qpos[:2] = object_xpos
+                        blocks_set[block] = True
+                        positions[i] = object_qpos[:3]
+                        self.sim.data.set_joint_qpos('{}:joint'.format(self.object_names[block]), object_qpos)
+                else:
+                    # A stack of 3 blocks
+                    if actual_stacks[0][1] == actual_stacks[1][0]:
+                        stack = [actual_stacks[0][0], actual_stacks[0][1], actual_stacks[1][1]]
+                    else:
+                        stack = [actual_stacks[1][0], actual_stacks[1][1], actual_stacks[0][1]]
+                    z_stack = [0.525, 0.475, 0.425]
+                    offset_on_table = self.np_random.uniform(-self.obj_range, self.obj_range, size=2)
+                    for i in stack:
+                        object_qpos = self.sim.data.get_joint_qpos('{}:joint'.format(self.object_names[i]))
+                        object_qpos[2] = z_stack[stack.index(i)]
+                        object_xpos = self.initial_gripper_xpos[:2] + offset_on_table
+                        object_qpos[:2] = object_xpos
+                        blocks_set[i] = True
+                        positions[i] = object_qpos[:3]
+                        self.sim.data.set_joint_qpos('{}:joint'.format(self.object_names[i]), object_qpos)
+            # Getting remaining blocks which were not placed
+            remain_block = [i for i, x in enumerate(blocks_set) if not x]
+            if len(remain_block) > 0:
+                if sum(init_config[:3]) == 1:
+                    remain_block = remain_block[0]
+                    object_qpos = self.sim.data.get_joint_qpos('{}:joint'.format(self.object_names[remain_block]))
+                    object_qpos[2] = 0.425
+                    # Added center to make sure the block stays on the table
+                    center = positions[np.where(blocks_set)[0][0]][:2] - self.initial_gripper_xpos[:2]
+                    object_xpos = positions[np.where(blocks_set)[0][0]][:2] + \
+                                  np.array([-np.sign(center[0]) * 0.1, -np.sign(center[1]) * 0.1])
+                    object_qpos[:2] = object_xpos
+                    blocks_set[remain_block] = True
+                    positions[remain_block] = object_qpos[:3]
+                    self.sim.data.set_joint_qpos('{}:joint'.format(self.object_names[remain_block]), object_qpos)
+                else:
+                    # The remaining block is close to the stack
+                    remain_block = remain_block[0]
+                    object_qpos = self.sim.data.get_joint_qpos('{}:joint'.format(self.object_names[remain_block]))
+                    object_qpos[2] = 0.425
+                    # Added center to make sure the block stays on the table
+                    center = positions[np.where(blocks_set)[0][0]][:2] - self.initial_gripper_xpos[:2]
+                    object_xpos = positions[np.where(blocks_set)[0][0]][:2] + np.array([0, -np.sign(center[1]) * 0.05])
+                    object_qpos[:2] = object_xpos
+                    blocks_set[remain_block] = True
+                    positions[remain_block] = object_qpos[:3]
+                    self.sim.data.set_joint_qpos('{}:joint'.format(self.object_names[remain_block]), object_qpos)
+
+        else:
+            if sum(init_config[:3]) == 0:
+                # All blocks are far
+                offset = self.np_random.uniform(0.1, self.obj_range)
+                offset1 = self.np_random.uniform(0.1, self.obj_range)
+                offsets = [[offset, -offset1], [-offset, offset1], [-offset1, -offset]]
+                np.random.shuffle(offsets)
+                for i, obj_name in enumerate(self.object_names):
+                    object_qpos = self.sim.data.get_joint_qpos('{}:joint'.format(obj_name))
+                    assert object_qpos.shape == (7,)
+                    object_qpos[2] = 0.425
+                    object_xpos = self.initial_gripper_xpos[:2] + offsets[i]
+                    object_qpos[:2] = object_xpos
+                    blocks_set[i] = True
+                    positions[i] = object_qpos[:3]
+                    self.sim.data.set_joint_qpos('{}:joint'.format(obj_name), object_qpos)
+
+            else:
+                possible_pairs = np.array([[0, 1], [0, 2], [1, 2]])
+                actual_close_pairs = possible_pairs[np.where(np.array(init_config[:3]) == 1.)]
+                if len(actual_close_pairs) == 3:
+                    # All blocks are close to each other
+                    pos_on_table_1 = self.initial_gripper_xpos[:2] + self.np_random.uniform(-self.obj_range, self.obj_range,
+                                                                                            size=2)
+                    pos_on_table_2 = pos_on_table_1 + [0, 0.05]
+                    pos_on_table_3 = pos_on_table_1 + [0.025, 0.05]
+                    xy = [pos_on_table_1, pos_on_table_2, pos_on_table_3]
+                    for i, obj_name in enumerate(self.object_names):
+                        object_qpos = self.sim.data.get_joint_qpos('{}:joint'.format(obj_name))
+                        object_qpos[2] = 0.425
+                        object_xpos = xy[i]
+                        object_qpos[:2] = object_xpos
+                        blocks_set[i] = True
+                        positions[i] = object_qpos[:3]
+                        self.sim.data.set_joint_qpos('{}:joint'.format(obj_name), object_qpos)
+                elif len(actual_close_pairs) == 2:
+                    pivot = list(set(actual_close_pairs[0]) & set(actual_close_pairs[1]))[0]
+                    indexes = [i for i in itertools.chain(actual_close_pairs[0], actual_close_pairs[1]) if i != pivot]
+                    indexes = [pivot] + indexes
+                    pos_on_tab_1 = self.initial_gripper_xpos[:2] + self.np_random.uniform(-self.obj_range, self.obj_range,size=2)
+                    pos_on_tab_2 = pos_on_tab_1 + np.array([0., 0.07])
+                    pos_on_tab_3 = pos_on_tab_1 - np.array([0., 0.07])
+                    xy = [pos_on_tab_1, pos_on_tab_2, pos_on_tab_3]
+                    for i, pos in zip(indexes, xy):
+                        object_qpos = self.sim.data.get_joint_qpos('{}:joint'.format(self.object_names[i]))
+                        object_qpos[2] = 0.425
+                        object_xpos = pos
+                        object_qpos[:2] = object_xpos
+                        blocks_set[i] = True
+                        positions[i] = object_qpos[:3]
+                        self.sim.data.set_joint_qpos('{}:joint'.format(self.object_names[i]), object_qpos)
+                else:
+                    for pair in actual_close_pairs:
+                        if not blocks_set[pair[0]]:
+                            pos_on_table_1 = self.initial_gripper_xpos[:2] + self.np_random.uniform(-self.obj_range, self.obj_range,
+                                                                                                    size=2)
+                        else:
+                            pos_on_table_1 = positions[pair[0]][:2]
+                        pos_on_table_2 = pos_on_table_1 + np.array([0, 0.07])
+                        xy = [pos_on_table_1, pos_on_table_2]
+                        for i, pos in zip(pair, xy):
+                            object_qpos = self.sim.data.get_joint_qpos('{}:joint'.format(self.object_names[i]))
+                            object_qpos[2] = 0.425
+                            object_xpos = pos
+                            object_qpos[:2] = object_xpos
+                            blocks_set[i] = True
+                            positions[i] = object_qpos[:3]
+                            self.sim.data.set_joint_qpos('{}:joint'.format(self.object_names[i]), object_qpos)
+                    if sum(blocks_set) != len(blocks_set):
+                        remain_block = np.where(np.invert(blocks_set))[0][0]
+                        object_qpos = self.sim.data.get_joint_qpos('{}:joint'.format(self.object_names[remain_block]))
+                        object_qpos[2] = 0.425
+                        # Added center to make sure the block stays on the table
+                        center = positions[np.where(blocks_set)[0][0]][:2] - self.initial_gripper_xpos[:2]
+                        object_xpos = positions[np.where(blocks_set)[0][0]][:2] + \
+                                      np.array([-np.sign(center[0])*0.1, -np.sign(center[1])*0.1])
+                        object_qpos[:2] = object_xpos
+                        blocks_set[remain_block] = True
+                        positions[remain_block] = object_qpos[:3]
+                        self.sim.data.set_joint_qpos('{}:joint'.format(self.object_names[remain_block]), object_qpos)
+
+        self.sim.forward()
+        obs = self._get_obs()
+
+        return obs
+
+
+
