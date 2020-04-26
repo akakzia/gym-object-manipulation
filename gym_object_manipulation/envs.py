@@ -1,7 +1,7 @@
 from gym_object_manipulation import fetch_manipulate_env
 from gym import utils
 
-PREDICATE_THRESHOLD = 0.08
+PREDICATE_THRESHOLD = 0.1
 
 class FetchManipulateCloseEnv(fetch_manipulate_env.FetchManipulateEnv, utils.EzPickle):
     def __init__(self, reward_type='sparse'):
